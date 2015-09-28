@@ -40,7 +40,7 @@
   ; -ss 16.0 -t 2.0 -i out.mov
   ; -filter_complex "[0][1][2]concat=n=3:v=1:a=0" spliced.mov
   (concat ["ffmpeg" "-y"]
-          (flatten (map (fn [[s e]] ["-ss" s "-t" (- e s) "-i" "temp.mov"]) clips))
+          (flatten (map (fn [[s e]] ["-ss" s "-t" (- e s) "-i" (tempfile "temp.mov")]) clips))
           ["-filter_complex"
            (str (string/join "" (map #(str "[" %1 "]") (range 0 (count clips))))
                 "concat=n=" (count clips)
@@ -177,6 +177,98 @@
          (if (or (> max-s 0) (> max-m 0) (> max-h 0)) (str (pad-left (str s) "0" 2) ".") "")
          (pad-right (str millis) "0" 3))))
 
+(defn vectize [elt-list]
+  (loop [v [] i 0]
+    (if (<= i (.-length elt-list))
+      (recur (conj v (.item elt-list i)) (inc i))
+      v)))
+
+(defn video [[app-cursor file mode] owner]
+  (reify
+    om/IInitState
+    (init-state [_]
+      {:time 0, :playing false})
+    om/IDidMount
+    (did-mount [_]
+      (let [container (.getDOMNode owner)
+            video-elt (.-firstChild container)
+            rerender #(om/refresh! owner)]
+        (.addEventListener video-elt "canplay" rerender)
+        (.addEventListener video-elt "loadeddata" rerender)
+        (.addEventListener video-elt "loadedmetadata" rerender)
+        (.addEventListener video-elt "timeupdate" #(om/set-state! owner [:time] (.-currentTime video-elt)))
+        (.addEventListener video-elt "play" #(om/set-state! owner [:playing] true))
+        (.addEventListener video-elt "pause" #(om/set-state! owner [:playing] false))))
+    om/IRenderState
+    (render-state [_ {playing :playing time :time}]
+      (let [duration (if (.isMounted owner)
+                       (.-duration (.-firstChild (.getDOMNode owner)))
+                       1)
+            time-points (case mode :edited (map first (rest (get-in app-cursor [:data :clips])))
+                                   :full (map first (get-in app-cursor [:data :commands])))
+            btn-pct 5
+            seek #(let [container (.getDOMNode owner)
+                        video-elt (.-firstChild container)
+                        duration (.-duration video-elt)
+                        clicked-x (.-pageX %)
+                        clicked-ratio (* 100 (/ clicked-x (.-clientWidth (.-body js/document))))
+                        clicked-ratio (- clicked-ratio btn-pct)
+                        clicked-ratio (/ clicked-ratio (- 100 btn-pct))
+                        clicked-time (* clicked-ratio duration)]
+                   (set! (.-currentTime video-elt) clicked-time)
+                   (.pause video-elt))
+            time->pct (fn [t] (str (+ btn-pct (* (/ t duration) (- 100 btn-pct))) "%"))]
+        ;(println (subs file (- (.-length file) 8)) "dur" duration "times" time-points)
+        (dom/div #js {}
+                 (dom/video (clj->js {:controls false :preload "metadata" :src file :style {:width "100%"}}))
+                 (apply dom/div #js {:style #js {:width "100%" :height "32px" :position "relative"}}
+                        (dom/div #js {:onClick #(let [container (.getDOMNode owner)
+                                                      video-elt (.-firstChild container)
+                                                      playing (om/get-state owner [:playing])]
+                                                 (if playing
+                                                   (.pause video-elt)
+                                                   (.play video-elt)))
+                                      :style   #js {:backgroundColor "blue"
+                                                    :color "white"
+                                                    :position        "absolute"
+                                                    :left            0 :top 0
+                                                    :width           (str btn-pct "%") :height "32px"
+                                                    :textAlign       "center"
+                                                    :MozUserSelect   "none"
+                                                    :MsUserSelect    "none"
+                                                    :userSelect      "none"
+                                                    :cursor          "default"}}
+                                 (if playing "| |" "|>"))
+                        (dom/div #js {:onMouseDown seek
+                                      :onMouseMove #(when (= 1 (.-buttons %)) (seek %))
+                                      :style       #js {:backgroundColor "grey"
+                                                        :width           (str (- 100 btn-pct) "%") :height "32px"
+                                                        :position        "absolute"
+                                                        :left            (str btn-pct "%") :top 0
+                                                        :MozUserSelect   "none"
+                                                        :MsUserSelect    "none"
+                                                        :userSelect      "none"
+                                                        :cursor          "default"}})
+                        (concat
+                          (map #(dom/div #js {:style #js {:position        "absolute"
+                                                          :left            (time->pct %) :top 0
+                                                          :width           "2px" :height "32px"
+                                                          :margin-left     "-1px"
+                                                          :backgroundColor "black"
+                                                          :pointerEvents   "none"}})
+                               time-points)
+                          [(dom/div #js {:style #js {:position        "absolute"
+                                                     :left            (time->pct time) :top "2px"
+                                                     :width           "8px" :height "28px"
+                                                     :backgroundColor "white"
+                                                     :margin-left     "-4px"
+                                                     :pointerEvents   "none"
+                                                     :MozUserSelect   "none"
+                                                     :MsUserSelect    "none"
+                                                     :userSelect      "none"
+                                                     :cursor          "default"}})])
+                        ))))))
+
 (om/root
   (fn [data _owner]
     (reify om/IRender
@@ -211,12 +303,12 @@
                            [(dom/p #js {} "Clips:")]
                            (mapv (fn [[s e]] (dom/p #js {} (str (s->hms s duration) "..." (s->hms e duration))))
                                  (get-in data [:data :clips]))
-                           [(dom/video (clj->js {:controls true :src (tempfile "spliced.mov") :style {:width "100%"}}))
+                           [(om/build video [data (tempfile "spliced.mov") :edited])
                             (dom/a (clj->js {:download "spliced-recording.mov" :href (tempfile "spliced.mov")}) "Save spliced video")]
                            [(dom/p #js {} "Unedited clips:")]
                            (mapv (fn [[s e]] (dom/p #js {} (str (s->hms s full-duration) "..." (s->hms e full-duration))))
                                  (get-in data [:data :unedited-clips]))
-                           [(dom/video (clj->js {:controls true :src (tempfile "temp.mov") :style {:width "100%"}}))
+                           [(om/build video [data (tempfile "temp.mov") :full])
                             (dom/a (clj->js {:download "full-recording.mov" :href (tempfile "temp.mov")}) "Save full video")]
                            )))))))
   app-state
