@@ -31,7 +31,7 @@
 (defn ffmpeg-start-command []
   ["ffmpeg" "-y"
    "-f" "avfoundation" "-r" "30" "-framerate" "30" "-capture_cursor" "1" "-i" "1:"
-   "-vcodec" "h264" "-pix_fmt" "yuv420p" (tempfile "/temp.mov")])
+   "-vcodec" "h264" "-pix_fmt" "yuv420p" (tempfile "temp.mov")])
 
 (defn ffmpeg-splice-command [clips]
   ;ffmpeg
@@ -45,7 +45,7 @@
            (str (string/join "" (map #(str "[" %1 "]") (range 0 (count clips))))
                 "concat=n=" (count clips)
                 ":v=1:a=0")
-           (tempfile "/spliced.mov")]))
+           (tempfile "spliced.mov")]))
 
 (defn run-command [cmd when-finished]
   (println (string/join " " cmd))
@@ -82,7 +82,8 @@
                :ready
                (if (= msg "save")
                  (do
-                   (let [proc (run-command (ffmpeg-start-command) #(handle-command "recording-finished"))]
+                   (let [proc (run-command (ffmpeg-start-command)
+                                           #(handle-command "recording-finished"))]
                      (assoc a
                        :mode :recording
                        :data {:clips              []
@@ -123,7 +124,8 @@
                :processing-recording
                (case msg
                  "recording-finished"
-                 (let [splicer (run-command (ffmpeg-splice-command (:clips data)) #(handle-command "editing-finished"))]
+                 (let [splicer (run-command (ffmpeg-splice-command (:unedited-clips data))
+                                            #(handle-command "editing-finished"))]
                    (assoc a
                      :mode :processing-edits
                      :data (assoc data :splicer splicer)
@@ -229,7 +231,7 @@
                                                    (.pause video-elt)
                                                    (.play video-elt)))
                                       :style   #js {:backgroundColor "blue"
-                                                    :color "white"
+                                                    :color           "white"
                                                     :position        "absolute"
                                                     :left            0 :top 0
                                                     :width           (str btn-pct "%") :height "32px"
