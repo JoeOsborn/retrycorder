@@ -1,6 +1,13 @@
 Make sure you have ffmpeg installed and are on a Mac.
 
-Run with `cd retrycorder && electron .`
+
+
+Run with these, probably in different terminal windows:
+```
+lein cljsbuild auto atom-dev
+lein figwheel frontend-dev
+electron .
+```
 
 `ctrl-r` to start recording or set a jump-back point; `ctrl-y` to jump back to the last such point; `ctrl-enter` to finish recording.
 
