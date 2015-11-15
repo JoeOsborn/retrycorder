@@ -1,9 +1,12 @@
 (ns ^:figwheel-always retrycorder.ui.core
-  (:require #_[cljs.core.async :as async]
+  (:require
+    [cljs.core.async :as async]
     [clojure.browser.dom]
     [om.core :as om :include-macros true]
     [om.dom :as dom :include-macros true]
-    [clojure.string :as string]))
+    [clojure.string :as string])
+  (:require-macros
+    [cljs.core.async.macros :as am]))
 
 (defonce remote (js/require "remote"))
 (defonce app (.require remote "app"))
@@ -13,7 +16,25 @@
 (enable-console-print!)
 
 (declare handle-command)
-(defonce app-state (atom {:mode :ready, :data {}}))
+(defonce app-state (atom {:mode            :ready,
+                          :data            {},
+                          :game            {:title          ""
+                                            :platform       ""
+                                            :developer      ""
+                                            :publisher      ""
+                                            :copyright_year nil
+                                            :version        ""},
+                          :editing-game    false,
+                          :candidate-games nil,
+                          :performance     {:title            ""
+                                            :description      ""
+                                            :performer        ""
+                                            :emulator_name    ""
+                                            :emulator_version ""
+                                            :notes            ""
+                                            ; be sure to automatically generate recording agent, date metadata
+                                            ; and also try to guess username, or at least remember across loads?
+                                            }}))
 
 (defn on-js-reload []
   (om/transact! (om/root-cursor app-state) [:__figwheel_counter] inc))
@@ -47,15 +68,20 @@
                 ":v=1:a=0")
            (tempfile "spliced.mov")]))
 
-(defn run-command [cmd when-finished]
+(defn run-command-in [cwd cmd when-finished]
   (println (string/join " " cmd))
-  (let [proc (.spawn process (first cmd) (clj->js (rest cmd)))]
-    (.on (.-stdout proc) "data" #(println "stdout:" %))
+  (let [proc (.spawn process (first cmd) (clj->js (rest cmd)) #js {"cwd" cwd})
+        output (atom "")]
+    (.on (.-stdout proc) "data" #(do (println "stdout:" %)
+                                     (swap! output (fn [o] (str o %)))))
     (.on (.-stderr proc) "data" #(println "stderr:" %))
     (.on proc "error" #(println "spawn error:" %))
     (.on proc "close" #(do (println "proc closed:" %)
-                           (when-finished)))
+                           (when-finished @output)))
     proc))
+
+(defn run-command [cmd when-finished]
+  (run-command-in "." cmd when-finished))
 
 (defn kill-proc [proc]
   (.kill proc))
@@ -83,7 +109,7 @@
                (if (= msg "save")
                  (do
                    (let [proc (run-command (ffmpeg-start-command)
-                                           #(handle-command "recording-finished"))]
+                                           (fn [_] (handle-command "recording-finished")))]
                      (assoc a
                        :mode :recording
                        :data {:clips              []
@@ -125,7 +151,7 @@
                (case msg
                  "recording-finished"
                  (let [splicer (run-command (ffmpeg-splice-command (:unedited-clips data))
-                                            #(handle-command "editing-finished"))]
+                                            (fn [_] (handle-command "editing-finished")))]
                    (assoc a
                      :mode :processing-edits
                      :data (assoc data :splicer splicer)
@@ -271,12 +297,148 @@
                                                      :cursor          "default"}})])
                         ))))))
 
+(defn update-candidate-games! [game-cursor]
+  ;jsonize game-cursor
+  (let [cleaned-game (into {} (filter (fn [[_k v]] (and (not= v "") (not= v nil)))
+                                      @game-cursor))
+        query (.stringify js/JSON (clj->js cleaned-game))
+        search-start 0
+        search-command (str "{" "\"start_index\":" search-start ", " "\"description\":" query "}")
+        full-command ["./citetool-editor/bin/python"
+                      "citetool_editor.py"
+                      "search" search-command]]
+    (run-command-in
+      "../citetool-editor"
+      full-command
+      (fn [outputs]
+        (let [js-candidates (.parse js/JSON outputs)
+              candidates (map (fn [game]
+                                (into {} (map (fn [[k v]]
+                                                [(keyword k) v])
+                                              game)))
+                              (get (js->clj js-candidates) "games"))]
+          (println "candidate games:" (string/join "\n" (map :title candidates)))
+          (om/transact! (om/root-cursor app-state)
+                        :candidate-games
+                        (fn [_] candidates)))))))
+
+(defn game-changed! [key cursor val]
+  (om/transact! cursor key (fn [_] val))
+  ; destroy the UUID and other invisible features for games which have been modified.
+  (om/transact! cursor (fn [game]
+                         (dissoc game
+                                 :uuid
+                                 :source_url
+                                 :data_image_checksum
+                                 :date_published
+                                 :source_data
+                                 :data_image_source
+                                 :notes
+                                 :localization_region)))
+  (update-candidate-games! cursor))
+
+(def hide-candidates-timer nil)
+
+(defn game-editing! [_cursor]
+  (.clearTimeout js/window hide-candidates-timer)
+  (om/transact! (om/root-cursor app-state) :editing-game (fn [_] true)))
+
+(defn game-not-editing! [_cursor]
+  (set! hide-candidates-timer
+        (.setTimeout js/window
+                     #(om/transact! (om/root-cursor app-state) :editing-game (fn [_] false))
+                     250)))
+
+(defn performance-changed! [key cursor val]
+  (om/transact! cursor key (fn [_] val)))
+
+(defn field [key cursor changed focus blur]
+  (dom/label #js {:onFocus (if focus #(focus cursor))
+                  :onBlur  (if blur #(blur cursor))
+                  :onChange
+                           (if changed
+                             (fn [evt]
+                               (let [new-str (.-value (.-target evt))]
+                                 (changed key cursor new-str))))}
+             (str (string/capitalize (string/replace (name key) "_" " ")) ":")
+             (if changed
+               (dom/input #js {:value (get cursor key)})
+               (dom/label nil (get cursor key)))
+             (dom/br nil)))
+
+(defn cite-game-ui [data _owner]
+  (reify
+    om/IRender
+    (render [_]
+      (dom/div nil
+               (dom/h2 nil "game")
+               (dom/form nil
+                         (field :title data game-changed! game-editing! game-not-editing!)
+                         (field :platform data game-changed! game-editing! game-not-editing!)
+                         (field :developer data game-changed! game-editing! game-not-editing!)
+                         (field :publisher data game-changed! game-editing! game-not-editing!)
+                         (field :copyright_year data game-changed! game-editing! game-not-editing!)
+                         (field :version data game-changed! game-editing! game-not-editing!))))))
+
+(defn candidate-game-ui [data owner]
+  (reify
+    om/IInitState
+    (init-state [_] {:hover false})
+    om/IRenderState
+    (render-state [_ state]
+      (dom/div #js {:style        #js {:marginBottom    "0.5em"
+                                       :border          (if (:hover state) "2px solid blue"
+                                                                           "2px solid black")
+                                       :backgroundColor (if (:hover state)
+                                                          "white"
+                                                          "inherit")}
+                    :onMouseEnter (fn [_]
+                                    (om/set-state! owner :hover true))
+                    :onMouseLeave (fn [_]
+                                    (om/set-state! owner :hover false))
+                    :onClick      (fn [_]
+                                    (om/transact! (om/root-cursor app-state) :game (fn [_] (om/get-props owner))))}
+               (dom/form nil
+                         (field :title data nil nil nil)
+                         (field :platform data nil nil nil)
+                         (field :developer data nil nil nil)
+                         (field :publisher data nil nil nil)
+                         (field :copyright_year data nil nil nil)
+                         (field :version data nil nil nil))))))
+
+(defn cite-performance-ui [data _owner]
+  (reify
+    om/IRender
+    (render [_]
+      (dom/div nil
+               (dom/h2 nil "performance")
+               (dom/form nil
+                         (field :title data performance-changed! nil nil)
+                         (field :description data performance-changed! nil nil)
+                         (field :performer data performance-changed! nil nil)
+                         (field :emulator_name data performance-changed! nil nil)
+                         (field :emulator_version data performance-changed! nil nil)
+                         (field :notes data performance-changed! nil nil))))))
+
 (om/root
   (fn [data _owner]
-    (reify om/IRender
+    (reify
+      om/IRender
       (render [_]
         (apply dom/div #js {}
                (dom/h1 #js {} "Retrycorder")
+               (dom/div nil
+                        (dom/div #js {:style #js {:float "left" :width "50%"}}
+                                 (om/build cite-game-ui (:game data)))
+                        (if (:editing-game data)
+                          (apply dom/div
+                                 #js {:style #js {:float "left" :width "50%" :overflow "scroll" :height "500px" :backgroundColor "lightGray"}}
+                                 (dom/h2 nil "candidate games")
+                                 (om/build candidate-game-ui (:game data))
+                                 (om/build-all candidate-game-ui (filter #(not= % (:game data))
+                                                                         (:candidate-games data))))
+                          (dom/div #js {:style #js {:float "left" :width "50%"}}
+                                   (om/build cite-performance-ui (:performance data)))))
                (case (:mode data)
                  :ready
                  [(dom/p #js {} "Press ctrl-r to start recording.")
