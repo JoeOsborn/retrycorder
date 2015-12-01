@@ -281,7 +281,7 @@
                           (map #(dom/div #js {:style #js {:position        "absolute"
                                                           :left            (time->pct %) :top 0
                                                           :width           "2px" :height "32px"
-                                                          :margin-left     "-1px"
+                                                          :marginLeft      "-1px"
                                                           :backgroundColor "black"
                                                           :pointerEvents   "none"}})
                                time-points)
@@ -289,7 +289,7 @@
                                                      :left            (time->pct time) :top "2px"
                                                      :width           "8px" :height "28px"
                                                      :backgroundColor "white"
-                                                     :margin-left     "-4px"
+                                                     :marginLeft      "-4px"
                                                      :pointerEvents   "none"
                                                      :MozUserSelect   "none"
                                                      :MsUserSelect    "none"
@@ -297,11 +297,14 @@
                                                      :cursor          "default"}})])
                         ))))))
 
+(defn querify [game-or-perf]
+  (let [cleaned (into {} (filter (fn [[_k v]] (and (not= v "") (not= v nil)))
+                                 game-or-perf))]
+    (.stringify js/JSON (clj->js cleaned))))
+
 (defn update-candidate-games! [game-cursor]
   ;jsonize game-cursor
-  (let [cleaned-game (into {} (filter (fn [[_k v]] (and (not= v "") (not= v nil)))
-                                      @game-cursor))
-        query (.stringify js/JSON (clj->js cleaned-game))
+  (let [query (querify @game-cursor)
         search-start 0
         search-command (str "{" "\"start_index\":" search-start ", " "\"description\":" query "}")
         full-command ["./citetool-editor/bin/python"
@@ -420,6 +423,64 @@
                          (field :emulator_version data performance-changed! nil nil)
                          (field :notes data performance-changed! nil nil))))))
 
+(defn export-game [game-data and-then]
+  (let [query (querify (dissoc game-data :schema_version))
+        full-command ["./citetool-editor/bin/python"
+                      "citetool_editor.py"
+                      "--no_prompts"
+                      "cite_game"
+                      "--export"
+                      "--partial"
+                      (str "{" "\"description\":" query "}")]]
+    (run-command-in
+      "../citetool-editor"
+      full-command
+      (fn [output]
+        (let [game (js->clj (.parse js/JSON output))
+              clean-game (into {} (map (fn [[k v]]
+                                         [(keyword k) v])
+                                       game))]
+          (println "exported game:" clean-game)
+          (om/transact! (om/root-cursor app-state)
+                        :game
+                        (fn [_] clean-game))
+          (and-then clean-game))))))
+
+(defn export-performance [perf-data perf-file and-then]
+  (let [query (querify (dissoc perf-data :schema_version))
+        full-command ["./citetool-editor/bin/python"
+                      "citetool_editor.py"
+                      "--no_prompts"
+                      "extract_file"
+                      "--partial_citation"
+                      (str "{" "\"description\":" query "}")
+                      (tempfile perf-file)]]
+    (run-command-in
+      "../citetool-editor"
+      full-command
+      (fn [output]
+        (and-then output)))))
+
+(defn download-link [default-name file text]
+  (dom/a (clj->js {:download default-name
+                   :href     (tempfile file)
+                   :onClick  #(let [game (:game @app-state)
+                                    performance (:performance @app-state)]
+                               ;export game?
+                               (if (:uuid game)
+                                 ;export performance linked to UUID
+                                 (export-performance (assoc performance :game_uuid (:uuid game))
+                                                     file
+                                                     (partial println "perf-old-game:"))
+                                 ;export game, callback to export performance linked to UUID
+                                 (export-game game
+                                              (fn [game]
+                                                (println "new-game:" game)
+                                                (export-performance (assoc performance :game_uuid (:uuid game))
+                                                                    file
+                                                                    (partial println "perf-new-game:"))))))})
+         text))
+
 (om/root
   (fn [data _owner]
     (reify
@@ -468,12 +529,12 @@
                            (mapv (fn [[s e]] (dom/p #js {} (str (s->hms s duration) "..." (s->hms e duration))))
                                  (get-in data [:data :clips]))
                            [(om/build video [data (tempfile "spliced.mov") :edited])
-                            (dom/a (clj->js {:download "spliced-recording.mov" :href (tempfile "spliced.mov")}) "Save spliced video")]
+                            (download-link "spliced-recording.mov" "spliced.mov" "Save spliced video")]
                            [(dom/p #js {} "Unedited clips:")]
                            (mapv (fn [[s e]] (dom/p #js {} (str (s->hms s full-duration) "..." (s->hms e full-duration))))
                                  (get-in data [:data :unedited-clips]))
                            [(om/build video [data (tempfile "temp.mov") :full])
-                            (dom/a (clj->js {:download "full-recording.mov" :href (tempfile "temp.mov")}) "Save full video")]
+                            (download-link "full-recording.mov" "temp.mov" "Save full video")]
                            )))))))
   app-state
   {:target (.getElementById js/document "app")})
